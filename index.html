@@ -156,6 +156,12 @@
       <div class="hint" id="cHint">トークンはこの端末の中だけに保存します。端末ごとに1回入力します。</div>
     </div>
     <div class="panel">
+      <div class="label">合言葉（他の端末への引き継ぎ）</div>
+      <input class="field" id="cPass" type="password" placeholder="12文字以上" autocapitalize="off" autocomplete="off" />
+      <button class="go" id="cPassBtn">合言葉で設定を復元する</button>
+      <div class="hint" id="pHint"></div>
+    </div>
+    <div class="panel">
       <div class="label">この端末に残っているもの</div>
       <div class="hint" id="devInfo" style="margin-top:0"></div>
     </div>
@@ -506,11 +512,66 @@ $("cSave").onclick = function(){
   if (!cfg.token){ $("cHint").textContent = "トークンを入れてください。"; return; }
   $("cHint").textContent = "確かめています…";
   api("/git/trees/" + BRANCH).then(function(){
-    $("cHint").textContent = "接続できました。"; $("cToken").placeholder = "入力済み（変えるときだけ入れる）"; sync();
+    $("cHint").textContent = "接続できました。"; $("cToken").placeholder = "入力済み（変えるときだけ入れる）"; passUi(); sync();
   }, function(e){
     $("cHint").textContent = "接続できませんでした（" + (e.status === 401 ? "トークンが違います" : e.status === 404 ? "保存先が見つからないか、トークンに権限がありません" : e.message) + "）";
   });
 };
+
+/* ---------- 合言葉での引き継ぎ ---------- */
+var KEY_PATH = "config/key.json", PBKDF_ITER = 600000, PASS_MIN = 12;
+function bytesB64(b){ var s = ""; b = new Uint8Array(b); for (var i = 0; i < b.length; i++) s += String.fromCharCode(b[i]); return btoa(s); }
+function b64Bytes(s){ var r = atob(s), b = new Uint8Array(r.length); for (var i = 0; i < r.length; i++) b[i] = r.charCodeAt(i); return b; }
+function passKey(pass, salt, iter){
+  return crypto.subtle.importKey("raw", new TextEncoder().encode(pass), "PBKDF2", false, ["deriveKey"]).then(function(km){
+    return crypto.subtle.deriveKey({name: "PBKDF2", salt: salt, iterations: iter, hash: "SHA-256"}, km, {name: "AES-GCM", length: 256}, false, ["encrypt", "decrypt"]);
+  });
+}
+function passUi(){
+  $("cPassBtn").textContent = cfg.token ? "この合言葉で引き継ぎを登録する" : "合言葉で設定を復元する";
+  if (!$("pHint").dataset.msg) $("pHint").textContent = cfg.token
+    ? "合言葉を登録すると、他のPCやスマホでは合言葉を入れるだけで使えます。暗号化したトークンをページ側に置くので、推測されにくい12文字以上にしてください。"
+    : "設定済みの端末で登録した合言葉を入れると、トークンを貼らずに使えます。";
+}
+function passMsg(t){ $("pHint").dataset.msg = "1"; $("pHint").textContent = t; }
+$("cPassBtn").onclick = function(){
+  var pass = $("cPass").value;
+  if (!window.crypto || !crypto.subtle){ passMsg("このブラウザでは使えません。"); return; }
+  if (pass.length < PASS_MIN){ passMsg("合言葉は" + PASS_MIN + "文字以上にしてください。"); return; }
+  $("cPassBtn").disabled = true;
+  var job;
+  if (cfg.token){                                   // 登録：暗号化して保存先へ置く（PC側がページへ写す）
+    var salt = crypto.getRandomValues(new Uint8Array(16)), iv = crypto.getRandomValues(new Uint8Array(12));
+    passMsg("登録しています…");
+    job = passKey(pass, salt, PBKDF_ITER).then(function(k){
+      return crypto.subtle.encrypt({name: "AES-GCM", iv: iv}, k, new TextEncoder().encode(JSON.stringify({token: cfg.token, owner: cfg.owner, repo: cfg.repo})));
+    }).then(function(ct){
+      var blob = {v: 1, iter: PBKDF_ITER, salt: bytesB64(salt), iv: bytesB64(iv), ct: bytesB64(ct), at: new Date().toISOString()};
+      return api("/contents/" + KEY_PATH + "?ref=" + BRANCH).then(function(f){ return f.sha; }, function(e){ if (e.status === 404) return null; throw e; })
+        .then(function(sha){ return putFile(KEY_PATH, blob, sha, "引き継ぎ用の設定"); });
+    }).then(function(){ $("cPass").value = ""; passMsg("登録しました。10分ほどで、他の端末から合言葉で使えるようになります。"); },
+            function(e){ passMsg("登録できませんでした（" + e.message + "）"); });
+  } else {                                          // 復元：ページ側の暗号化データを合言葉で開く
+    passMsg("確かめています…");
+    job = fetch("key.json?v=" + Date.now(), {cache: "no-store"}).then(function(r){
+      if (!r.ok) throw new Error("nokey"); return r.json();
+    }).then(function(b){
+      return passKey(pass, b64Bytes(b.salt), b.iter).then(function(k){
+        return crypto.subtle.decrypt({name: "AES-GCM", iv: b64Bytes(b.iv)}, k, b64Bytes(b.ct));
+      }).then(function(pt){ return JSON.parse(new TextDecoder().decode(pt)); }, function(){ throw new Error("badpass"); });
+    }).then(function(c){
+      cfg = {owner: c.owner || DEFAULT_OWNER, repo: c.repo || DEFAULT_REPO, token: c.token};
+      LS.set("im_cfg", cfg); $("cPass").value = "";
+      $("cOwner").value = cfg.owner; $("cRepo").value = cfg.repo; $("cToken").placeholder = "入力済み（変えるときだけ入れる）";
+      delete $("pHint").dataset.msg; passUi(); passMsg("設定できました。");
+      return sync();
+    }, function(e){
+      passMsg(e.message === "nokey" ? "まだ合言葉が登録されていません。設定済みの端末で登録してください。" : e.message === "badpass" ? "合言葉が違います。" : "復元できませんでした（" + e.message + "）");
+    });
+  }
+  job.then(function(){ $("cPassBtn").disabled = false; passUi(); });
+};
+passUi();
 
 /* ---------- 起動 ---------- */
 var draft = LS.get("im_draft", null);
