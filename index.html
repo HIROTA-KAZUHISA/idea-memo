@@ -67,6 +67,12 @@
     .btns{display:flex;flex-wrap:wrap;gap:6px}
     .hint{font-size:12px;color:var(--muted);margin-top:8px;line-height:1.6}
     .card{display:block;width:100%;text-align:left;border:1px solid var(--line);background:var(--panel);border-radius:14px;padding:12px;margin-bottom:8px}
+    .card .open{cursor:pointer}
+    .card.fav{border-color:rgba(255,205,90,.65);background:rgba(255,205,90,.07)}
+    .card.drop{opacity:.6}
+    .cardBtns{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;margin-top:10px}
+    .cardBtns .btn{min-height:40px;padding:6px 4px;font-size:13px}
+    .btn.favOn{background:rgba(255,205,90,.28);border-color:rgba(255,205,90,.7)}
     .card .meta{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;color:var(--muted);margin-bottom:6px}
     .card .txt{font-size:15px;line-height:1.6;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden;white-space:pre-wrap;word-break:break-word}
     .card .lead{font-size:13px;color:var(--muted);margin-top:6px;line-height:1.5;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -140,8 +146,8 @@
         <input class="field" id="q" placeholder="メモ・派生案を検索" />
         <div class="btns" style="margin-top:8px" id="filters">
           <button class="btn on" data-f="all">すべて</button>
-          <button class="btn" data-f="active">進行中</button>
-          <button class="btn" data-f="stopped">停止中</button>
+          <button class="btn" data-f="fav">★ お気に入り</button>
+          <button class="btn" data-f="stopped">検討中止</button>
         </div>
       </div>
       <div id="cards"></div>
@@ -286,10 +292,13 @@ function sync(quiet){
 }
 
 /* ---------- データ ---------- */
+function groupOf(m){ return m.status === "stopped" ? 2 : m.fav ? 0 : 1; }
 function allMemos(){
   var m = {}; Object.keys(cache.memos).forEach(function(k){ m[k] = cache.memos[k]; });
   Object.keys(outbox).forEach(function(k){ m[k] = outbox[k]; });
   return Object.keys(m).map(function(k){ return m[k]; }).sort(function(a, b){
+    var ga = groupOf(a), gb = groupOf(b);          // お気に入り → その他 → 検討中止
+    if (ga !== gb) return ga - gb;
     return ((b.date || "") + (b.time || "") + b.id).localeCompare((a.date || "") + (a.time || "") + a.id);
   });
 }
@@ -306,7 +315,7 @@ function stateOf(m){
   var e = cache.expands[m.id], n = roundsOf(m.id).length;
   var morePending = (m.more || 0) > ((e && e.moreDone) || 0);
   if (outbox[m.id] && !cache.memos[m.id]) return {cls: "unsent", label: "未送信"};
-  if (m.status === "stopped") return {cls: "stop", label: "停止中 " + n + "回"};
+  if (m.status === "stopped") return {cls: "stop", label: "検討中止 " + n + "回"};
   if (voiceWait(m)) return {cls: "voice", label: "文字起こし待ち"};
   if (m.audio && textOf(m.id).failed && !(m.text || "").trim()) return {cls: "unsent", label: "聞き取れず"};
   if (n === 0) return {cls: "wait", label: "AI待ち"};
@@ -348,7 +357,7 @@ function fmtAt(iso){ var d = new Date(iso); if (isNaN(d)) return ""; return (d.g
 function renderList(){
   var q = $("q").value.trim().toLowerCase();
   var items = allMemos().filter(function(m){
-    if (filter === "active" && m.status === "stopped") return false;
+    if (filter === "fav" && groupOf(m) !== 0) return false;
     if (filter === "stopped" && m.status !== "stopped") return false;
     if (!q) return true;
     var hay = [bodyOf(m), m.comment, m.date].concat(roundsOf(m.id).map(function(r){ return [r.title, r.summary, r.body, r.angle].join(" "); })).join(" ").toLowerCase();
@@ -360,9 +369,16 @@ function renderList(){
   }
   $("cards").innerHTML = items.map(function(m){
     var st = stateOf(m), rs = roundsOf(m.id), last = rs[rs.length - 1];
-    return '<button class="card" data-id="' + esc(m.id) + '"><div class="meta"><span>' + esc(fmtDate(m)) + '</span><span class="badge ' + st.cls + '">' + esc(st.label) + "</span></div>" +
+    var g = groupOf(m);
+    return '<div class="card' + (g === 0 ? " fav" : g === 2 ? " drop" : "") + '" data-id="' + esc(m.id) + '"><div class="open" role="button" tabindex="0">' +
+      '<div class="meta"><span>' + (g === 0 ? "★ " : "") + esc(fmtDate(m)) + '</span><span class="badge ' + st.cls + '">' + esc(st.label) + "</span></div>" +
       '<div class="txt">' + esc(bodyOf(m)) + "</div>" +
-      (last ? '<div class="lead">→ ' + esc(last.title || last.summary || "") + "</div>" : "") + "</button>";
+      (last ? '<div class="lead">→ ' + esc(last.title || last.summary || "") + "</div>" : "") + "</div>" +
+      '<div class="cardBtns">' +
+        '<button class="btn' + (g === 0 ? " favOn" : "") + '" data-cact="fav">' + (g === 0 ? "★ 外す" : "☆ お気に入り") + "</button>" +
+        '<button class="btn' + (g === 2 ? " on" : "") + '" data-cact="drop">' + (g === 2 ? "検討を再開" : "検討中止") + "</button>" +
+        '<button class="btn danger" data-cact="del">削除</button>' +
+      "</div></div>";
   }).join("");
 }
 function renderDetail(){
@@ -377,7 +393,8 @@ function renderDetail(){
     (m.comment ? '<div class="memoComment">' + esc(m.comment) + "</div>" : "") +
     '<div class="btns" style="margin-top:12px">' +
       '<button class="btn" data-act="more"' + (morePending || stopped ? " disabled style=\"opacity:.5\"" : "") + ">" + (morePending ? "依頼済み（次の確認で実行）" : "もっと膨らます") + "</button>" +
-      '<button class="btn" data-act="toggle">' + (stopped ? "再開する" : "ここで止める") + "</button>" +
+      '<button class="btn' + (groupOf(m) === 0 ? " favOn" : "") + '" data-act="fav">' + (groupOf(m) === 0 ? "★ 外す" : "☆ お気に入り") + "</button>" +
+      '<button class="btn" data-act="toggle">' + (stopped ? "検討を再開" : "検討中止") + "</button>" +
       '<button class="btn" data-act="comment">コメントを直す</button>' +
       '<button class="btn danger" data-act="del">削除</button>' +
     "</div></div>";
@@ -419,7 +436,22 @@ $("filters").onclick = function(ev){
   renderList();
 };
 $("q").oninput = renderList;
-$("cards").onclick = function(ev){ var c = ev.target.closest(".card"); if (!c) return; openId = c.dataset.id; render(); window.scrollTo(0, 0); };
+function setFav(m){ m.fav = !(m.fav && m.status !== "stopped"); m.status = "active"; saveMemo(m); }       // お気に入りにすると検討中止は外れる
+function setDrop(m){ if (m.status === "stopped") m.status = "active"; else { m.status = "stopped"; m.fav = false; } saveMemo(m); }
+function askDelete(id){
+  if (!confirm("このメモと派生案を削除します。元に戻せません。よろしいですか？")) return;
+  removeMemo(id);
+}
+$("cards").onclick = function(ev){
+  var c = ev.target.closest(".card"); if (!c) return;
+  var b = ev.target.closest("button[data-cact]");
+  if (!b){ if (ev.target.closest(".open")){ openId = c.dataset.id; render(); window.scrollTo(0, 0); } return; }
+  var m = allMemos().filter(function(x){ return x.id === c.dataset.id; })[0]; if (!m) return;
+  m = JSON.parse(JSON.stringify(m));
+  if (b.dataset.cact === "fav") setFav(m);
+  else if (b.dataset.cact === "drop") setDrop(m);
+  else if (b.dataset.cact === "del") askDelete(m.id);
+};
 $("detailView").onclick = function(ev){
   var b = ev.target.closest("button[data-act]"); if (!b) return;
   var act = b.dataset.act, m = allMemos().filter(function(x){ return x.id === openId; })[0];
@@ -427,7 +459,8 @@ $("detailView").onclick = function(ev){
   if (!m) return;
   m = JSON.parse(JSON.stringify(m));
   if (act === "more"){ m.more = (m.more || 0) + 1; saveMemo(m); toast("依頼しました。次の確認（10分以内）で膨らませます"); }
-  else if (act === "toggle"){ m.status = m.status === "stopped" ? "active" : "stopped"; saveMemo(m); }
+  else if (act === "toggle"){ setDrop(m); }
+  else if (act === "fav"){ setFav(m); }
   else if (act === "comment"){
     var v = prompt("コメント", m.comment || ""); if (v == null) return;
     m.comment = v.trim(); saveMemo(m);
@@ -448,9 +481,12 @@ function removeMemo(id){
   if (wasLocalOnly){ render(); return; }
   setStatus("削除中…");
   var mm = cache.memos[id] || {};
-  var paths = [memoPath(id), expPath(id), "text/" + id + ".json", mm.audio || ""].filter(function(p){ return cache.shas[p]; });
+  var shas = {}, paths = [memoPath(id), expPath(id), "text/" + id + ".json", mm.audio || ""].filter(function(p){ shas[p] = cache.shas[p]; return shas[p]; });
+  delete cache.memos[id]; delete cache.expands[id]; delete cache.texts[id];      // 一覧からはすぐ消す（失敗したら次の更新で戻る）
+  paths.forEach(function(p){ delete cache.shas[p]; });
+  LS.set("im_cache", cache); render();
   paths.reduce(function(p, path){ return p.then(function(){
-    return api("/contents/" + path, {method: "DELETE", body: {message: "削除 " + id, sha: cache.shas[path], branch: BRANCH}});
+    return api("/contents/" + path, {method: "DELETE", body: {message: "削除 " + id, sha: shas[path], branch: BRANCH}});
   }); }, Promise.resolve())
     .then(function(){ toast("削除しました"); }, function(){ toast("削除できませんでした"); })
     .then(function(){ return sync(true); });
