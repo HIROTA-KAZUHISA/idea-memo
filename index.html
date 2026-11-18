@@ -172,7 +172,9 @@ var LS = {
   del: function(k){ try{ localStorage.removeItem(k); }catch(e){} }
 };
 var DEFAULT_OWNER = "HIROTA-KAZUHISA", DEFAULT_REPO = "idea-memo-data", BRANCH = "main", MAX_ROUNDS = 5;
+var TOKEN_RE = /^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/;
 var cfg = LS.get("im_cfg", {owner: DEFAULT_OWNER, repo: DEFAULT_REPO, token: ""});
+if (cfg.token && !TOKEN_RE.test(cfg.token)){ cfg.token = ""; LS.set("im_cfg", cfg); }   // 間違って入れた文字は捨てる
 var cache = LS.get("im_cache", {memos:{}, expands:{}, shas:{}});   // 最後に取得した内容
 var outbox = LS.get("im_outbox", {});                               // 未送信のメモ {id: memo}
 var filter = "all", openId = null, busy = false;
@@ -495,6 +497,10 @@ $("cOwner").value = cfg.owner || ""; $("cRepo").value = cfg.repo || "";
 $("cToken").placeholder = cfg.token ? "入力済み（変えるときだけ入れる）" : "github_pat_…";
 $("cSave").onclick = function(){
   var t = $("cToken").value.trim();
+  if (t && !TOKEN_RE.test(t)){
+    $("cHint").textContent = "これはトークンではありません。「github_pat_」で始まる長い文字列を貼ってください（ページのアドレスや名前ではありません）。";
+    $("cToken").value = ""; return;
+  }
   cfg = {owner: $("cOwner").value.trim() || DEFAULT_OWNER, repo: $("cRepo").value.trim() || DEFAULT_REPO, token: t || cfg.token || ""};
   LS.set("im_cfg", cfg); $("cToken").value = "";
   if (!cfg.token){ $("cHint").textContent = "トークンを入れてください。"; return; }
