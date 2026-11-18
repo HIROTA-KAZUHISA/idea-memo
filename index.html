@@ -74,8 +74,11 @@
     .badge.ai{background:rgba(36,211,238,.2);border-color:rgba(36,211,238,.5)}
     .badge.wait{background:rgba(255,196,84,.16);border-color:rgba(255,196,84,.5);color:var(--warn)}
     .badge.stop{opacity:.7}
+    .badge.voice{background:rgba(124,92,255,.22);border-color:rgba(124,92,255,.6)}
     .badge.unsent{background:rgba(255,110,110,.16);border-color:rgba(255,110,110,.5);color:var(--bad)}
     .memoBody{font-size:16px;line-height:1.7;white-space:pre-wrap;word-break:break-word}
+    .memoRaw{font-size:13px;color:var(--muted);margin-top:8px}
+    .memoRaw summary{cursor:pointer;min-height:32px}
     .memoComment{font-size:14px;color:var(--muted);line-height:1.6;white-space:pre-wrap;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line)}
     details.round{border:1px solid var(--line);background:var(--panel);border-radius:14px;margin-bottom:8px;overflow:hidden}
     details.round summary{list-style:none;padding:12px;cursor:pointer;min-height:48px}
@@ -117,12 +120,16 @@
       </div>
       <button class="mic" id="mic">🎤 話してメモする</button>
       <div class="interim" id="interim"></div>
-      <div class="label">メモ</div>
-      <textarea class="field" id="fText" rows="5" placeholder="思いついたことを話すか、ここに書く"></textarea>
+      <div id="recBox" hidden>
+        <audio id="recPlay" controls style="width:100%;margin-top:6px"></audio>
+        <div class="btns" style="margin-top:6px"><button class="btn" id="recRedo">録り直す</button><button class="btn danger" id="recDrop">録音を消す</button></div>
+      </div>
+      <div class="label">メモ（書いて足したいときだけ）</div>
+      <textarea class="field" id="fText" rows="3" placeholder="録音だけでも保存できます"></textarea>
       <div class="label">コメント（任意）</div>
       <textarea class="field" id="fComment" rows="2" placeholder="きっかけ・狙い・調べてほしい方向など"></textarea>
       <button class="go" id="save">保存する</button>
-      <div class="hint" id="newHint">保存すると、10分以内にAIが世の中の情報を調べて膨らませます。その後も1日2回、切り口を変えて膨らませます（5回まで）。</div>
+      <div class="hint" id="newHint">録音は保存後10分以内にPCのAIが文字に直し、世の中の情報を調べて膨らませます。その後も1日2回、切り口を変えて膨らませます（5回まで）。</div>
     </div>
   </section>
 
@@ -181,9 +188,10 @@ var DEFAULT_OWNER = "HIROTA-KAZUHISA", DEFAULT_REPO = "idea-memo-data", BRANCH =
 var TOKEN_RE = /^(github_pat_|ghp_)[A-Za-z0-9_]{20,}$/;
 var cfg = LS.get("im_cfg", {owner: DEFAULT_OWNER, repo: DEFAULT_REPO, token: ""});
 if (cfg.token && !TOKEN_RE.test(cfg.token)){ cfg.token = ""; LS.set("im_cfg", cfg); }   // 間違って入れた文字は捨てる
-var cache = LS.get("im_cache", {memos:{}, expands:{}, shas:{}});   // 最後に取得した内容
+var cache = LS.get("im_cache", {memos:{}, expands:{}, texts:{}, shas:{}});
+if (!cache.texts) cache.texts = {};   // 最後に取得した内容
 var outbox = LS.get("im_outbox", {});                               // 未送信のメモ {id: memo}
-var filter = "all", openId = null, busy = false;
+var filter = "all", openId = null, busy = false, audioMem = {};
 function $(id){ return document.getElementById(id); }
 function esc(s){ return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){ return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]; }); }
 function pad(n){ return (n < 10 ? "0" : "") + n; }
@@ -222,7 +230,11 @@ function flushOutbox(){
     p = p.then(function(){
       var m = outbox[id];
       function send(sha){ return putFile(memoPath(id), m, sha, "メモ " + id); }
-      return send(cache.shas[memoPath(id)]).catch(function(e){
+      var au = audioMem[id] || LS.get("im_au_" + id, null), pre = Promise.resolve();
+      if (au && m.audio) pre = api("/contents/" + m.audio, {method: "PUT", body: {message: "録音 " + id, content: au, branch: BRANCH}})
+        .catch(function(e){ if (e.status !== 422 && e.status !== 409) throw e; })      // 既に届いていればよい
+        .then(function(){ delete audioMem[id]; LS.del("im_au_" + id); });
+      return pre.then(function(){ return send(cache.shas[memoPath(id)]); }).catch(function(e){
         if (e.status === 409 || e.status === 422){   // 手元の版が古い → 取り直して送り直す
           return api("/contents/" + memoPath(id) + "?ref=" + BRANCH).then(function(f){ return send(f.sha); },
             function(e2){ if (e2.status === 404) return send(null); throw e2; });
@@ -240,11 +252,13 @@ function flushOutbox(){
 }
 function pull(){
   return api("/git/trees/" + BRANCH + "?recursive=1").then(function(t){
-    var files = (t.tree || []).filter(function(e){ return e.type === "blob" && /^(memos|expand)\/[^\/]+\.json$/.test(e.path); });
-    var memos = {}, expands = {}, shas = {}, jobs = [];
+    var files = (t.tree || []).filter(function(e){ return e.type === "blob" && /^(memos|expand|text)\/[^\/]+\.json$/.test(e.path); });
+    var memos = {}, expands = {}, texts = {}, shas = {}, jobs = [];
+    (t.tree || []).forEach(function(e){ if (e.type === "blob" && e.path.indexOf("audio/") === 0) shas[e.path] = e.sha; });
     files.forEach(function(f){
-      var id = f.path.replace(/^.*\//, "").replace(/\.json$/, ""), isMemo = f.path.indexOf("memos/") === 0;
-      var store = isMemo ? memos : expands, old = isMemo ? cache.memos : cache.expands;
+      var id = f.path.replace(/^.*\//, "").replace(/\.json$/, ""), dir = f.path.split("/")[0];
+      var store = dir === "memos" ? memos : dir === "expand" ? expands : texts;
+      var old = dir === "memos" ? cache.memos : dir === "expand" ? cache.expands : cache.texts;
       shas[f.path] = f.sha;
       if (cache.shas[f.path] === f.sha && old[id]) { store[id] = old[id]; return; }
       jobs.push(api("/git/blobs/" + f.sha).then(function(b){
@@ -252,7 +266,7 @@ function pull(){
       }));
     });
     return Promise.all(jobs).then(function(){
-      cache = {memos: memos, expands: expands, shas: shas};
+      cache = {memos: memos, expands: expands, texts: texts, shas: shas};
       LS.set("im_cache", cache);
     });
   });
@@ -279,12 +293,22 @@ function allMemos(){
     return ((b.date || "") + (b.time || "") + b.id).localeCompare((a.date || "") + (a.time || "") + a.id);
   });
 }
+function textOf(id){ return cache.texts[id] || null; }
+function bodyOf(m){
+  var t = textOf(m.id), parts = [m.text || "", (t && t.text) || ""].filter(function(x){ return x.trim(); });
+  if (parts.length) return parts.join("\n\n");
+  if (m.audio) return t && t.failed ? "（録音を聞き取れませんでした）" : "（録音メモ：文字に直しています）";
+  return "";
+}
+function voiceWait(m){ return !!m.audio && !textOf(m.id); }
 function roundsOf(id){ var e = cache.expands[id]; return (e && e.rounds) || []; }
 function stateOf(m){
   var e = cache.expands[m.id], n = roundsOf(m.id).length;
   var morePending = (m.more || 0) > ((e && e.moreDone) || 0);
   if (outbox[m.id] && !cache.memos[m.id]) return {cls: "unsent", label: "未送信"};
   if (m.status === "stopped") return {cls: "stop", label: "停止中 " + n + "回"};
+  if (voiceWait(m)) return {cls: "voice", label: "文字起こし待ち"};
+  if (m.audio && textOf(m.id).failed && !(m.text || "").trim()) return {cls: "unsent", label: "聞き取れず"};
   if (n === 0) return {cls: "wait", label: "AI待ち"};
   if (morePending) return {cls: "wait", label: n + "回＋依頼中"};
   if (n >= MAX_ROUNDS) return {cls: "ai", label: n + "回（上限）"};
@@ -327,7 +351,7 @@ function renderList(){
     if (filter === "active" && m.status === "stopped") return false;
     if (filter === "stopped" && m.status !== "stopped") return false;
     if (!q) return true;
-    var hay = [m.text, m.comment, m.date].concat(roundsOf(m.id).map(function(r){ return [r.title, r.summary, r.body, r.angle].join(" "); })).join(" ").toLowerCase();
+    var hay = [bodyOf(m), m.comment, m.date].concat(roundsOf(m.id).map(function(r){ return [r.title, r.summary, r.body, r.angle].join(" "); })).join(" ").toLowerCase();
     return hay.indexOf(q) >= 0;
   });
   if (!items.length){
@@ -337,7 +361,7 @@ function renderList(){
   $("cards").innerHTML = items.map(function(m){
     var st = stateOf(m), rs = roundsOf(m.id), last = rs[rs.length - 1];
     return '<button class="card" data-id="' + esc(m.id) + '"><div class="meta"><span>' + esc(fmtDate(m)) + '</span><span class="badge ' + st.cls + '">' + esc(st.label) + "</span></div>" +
-      '<div class="txt">' + esc(m.text) + "</div>" +
+      '<div class="txt">' + esc(bodyOf(m)) + "</div>" +
       (last ? '<div class="lead">→ ' + esc(last.title || last.summary || "") + "</div>" : "") + "</button>";
   }).join("");
 }
@@ -348,7 +372,8 @@ function renderDetail(){
   var e = cache.expands[m.id], morePending = (m.more || 0) > ((e && e.moreDone) || 0);
   var h = '<div class="btns" style="margin-bottom:8px"><button class="btn" data-act="back">← 一覧へ</button></div>' +
     '<div class="panel"><div class="card" style="border:0;padding:0;margin:0;background:none"><div class="meta"><span>' + esc(fmtDate(m)) + '</span><span class="badge ' + st.cls + '">' + esc(st.label) + "</span></div></div>" +
-    '<div class="memoBody">' + esc(m.text) + "</div>" +
+    '<div class="memoBody">' + esc(bodyOf(m)) + "</div>" +
+    ((textOf(m.id) && textOf(m.id).raw && textOf(m.id).raw !== textOf(m.id).text) ? '<details class="memoRaw"><summary>整える前の聞き取り</summary>' + esc(textOf(m.id).raw) + "</details>" : "") +
     (m.comment ? '<div class="memoComment">' + esc(m.comment) + "</div>" : "") +
     '<div class="btns" style="margin-top:12px">' +
       '<button class="btn" data-act="more"' + (morePending || stopped ? " disabled style=\"opacity:.5\"" : "") + ">" + (morePending ? "依頼済み（次の確認で実行）" : "もっと膨らます") + "</button>" +
@@ -383,7 +408,6 @@ function render(){
 function showTab(name){
   ["new", "list", "set"].forEach(function(t){ $("p-" + t).hidden = t !== name; });
   Array.prototype.forEach.call(document.querySelectorAll(".tab"), function(b){ b.classList.toggle("on", b.dataset.tab === name); });
-  if (name !== "new") stopRec();
   if (name === "list"){ render(); sync(true); }
 }
 Array.prototype.forEach.call(document.querySelectorAll(".tab"), function(b){ b.onclick = function(){ openId = null; showTab(b.dataset.tab); }; });
@@ -419,11 +443,12 @@ $("detailView").onclick = function(ev){
 };
 function removeMemo(id){
   var wasLocalOnly = !cache.memos[id];
-  delete outbox[id]; LS.set("im_outbox", outbox);
+  delete outbox[id]; LS.set("im_outbox", outbox); delete audioMem[id]; LS.del("im_au_" + id);
   openId = null;
   if (wasLocalOnly){ render(); return; }
   setStatus("削除中…");
-  var paths = [memoPath(id), expPath(id)].filter(function(p){ return cache.shas[p]; });
+  var mm = cache.memos[id] || {};
+  var paths = [memoPath(id), expPath(id), "text/" + id + ".json", mm.audio || ""].filter(function(p){ return cache.shas[p]; });
   paths.reduce(function(p, path){ return p.then(function(){
     return api("/contents/" + path, {method: "DELETE", body: {message: "削除 " + id, sha: cache.shas[path], branch: BRANCH}});
   }); }, Promise.resolve())
@@ -443,38 +468,63 @@ function speak(text, btn){
   speaking = btn; btn.textContent = "■ 止める"; speechSynthesis.speak(u);
 }
 
-/* ---------- 音声入力 ---------- */
-var SR = window.SpeechRecognition || window.webkitSpeechRecognition, rec = null, recOn = false;
-function appendText(t){
-  var ta = $("fText"); t = t.trim(); if (!t) return;
-  ta.value = ta.value ? ta.value.replace(/\s+$/, "") + "\n" + t : t;
+/* ---------- 録音 ---------- */
+var REC_MAX_SEC = 300, recOn = false, mediaRec = null, recChunks = [], recTimer = null, recStart = 0;
+var recBlob = null, recSec = 0;      // 保存前の録音
+function recMime(){
+  var c = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  for (var i = 0; i < c.length; i++) if (window.MediaRecorder && MediaRecorder.isTypeSupported(c[i])) return c[i];
+  return "";
+}
+function showRec(){
+  var has = !!recBlob;
+  $("recBox").hidden = !has;
+  if (has){ $("recPlay").src = URL.createObjectURL(recBlob); }
+  else { $("recPlay").removeAttribute("src"); }
+  $("mic").textContent = has ? "録音済み " + recSec + "秒（下で聞き直せます）" : "🎤 話してメモする";
+  $("mic").disabled = has;
+  $("mic").style.opacity = has ? ".6" : "";
 }
 function startRec(){
-  if (!SR){ toast("この端末は音声入力に未対応です。キーボードのマイクを使ってください"); $("fText").focus(); return; }
-  recOn = true; $("mic").classList.add("rec"); $("mic").textContent = "■ 録音中（押すと止まる）";
-  listen();
-}
-function listen(){
-  rec = new SR(); rec.lang = "ja-JP"; rec.continuous = false; rec.interimResults = true;
-  rec.onresult = function(ev){
-    var interim = "";
-    for (var i = ev.resultIndex; i < ev.results.length; i++){
-      if (ev.results[i].isFinal) appendText(ev.results[i][0].transcript); else interim += ev.results[i][0].transcript;
+  if (!navigator.mediaDevices || !window.MediaRecorder){ toast("この端末は録音に未対応です。メモ欄に書いてください"); return; }
+  navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true}}).then(function(stream){
+    recChunks = [];
+    var mime = recMime(), opt = {audioBitsPerSecond: 32000}; if (mime) opt.mimeType = mime;
+    mediaRec = new MediaRecorder(stream, opt);
+    mediaRec.ondataavailable = function(ev){ if (ev.data && ev.data.size) recChunks.push(ev.data); };
+    mediaRec.onstop = function(){
+      recSec = Math.max(1, Math.round((Date.now() - recStart) / 1000));
+      recBlob = new Blob(recChunks, {type: mediaRec.mimeType || mime || "audio/webm"});
+      stream.getTracks().forEach(function(t){ t.stop(); });
+      clearInterval(recTimer); recOn = false; $("mic").classList.remove("rec");
+      if (recBlob.size < 800){ recBlob = null; toast("録音できていません。もう一度お試しください"); }
+      showRec();
+    };
+    recStart = Date.now(); recOn = true; mediaRec.start(1000);
+    $("mic").disabled = false; $("mic").style.opacity = "";
+    $("mic").classList.add("rec");
+    function tick(){
+      var sec = Math.floor((Date.now() - recStart) / 1000);
+      $("mic").textContent = "■ 録音中 " + Math.floor(sec / 60) + ":" + pad(sec % 60) + "（押すと止まる）";
+      if (sec >= REC_MAX_SEC){ toast("5分になったので止めました"); stopRec(); }
     }
-    $("interim").textContent = interim;
-  };
-  rec.onerror = function(ev){
-    if (ev.error === "not-allowed" || ev.error === "service-not-allowed"){ toast("マイクの使用が許可されていません"); stopRec(); }
-  };
-  rec.onend = function(){ $("interim").textContent = ""; if (recOn) { try{ listen(); }catch(e){ stopRec(); } } };
-  try{ rec.start(); }catch(e){}
+    tick(); recTimer = setInterval(tick, 500);
+  }, function(){ toast("マイクの使用が許可されていません"); });
 }
 function stopRec(){
   if (!recOn) return;
-  recOn = false; $("mic").classList.remove("rec"); $("mic").textContent = "🎤 話してメモする"; $("interim").textContent = "";
-  try{ rec && rec.stop(); }catch(e){}
+  try{ if (mediaRec && mediaRec.state !== "inactive") mediaRec.stop(); }catch(e){}
 }
-$("mic").onclick = function(){ recOn ? stopRec() : startRec(); };
+$("mic").onclick = function(){ if (recOn) stopRec(); else startRec(); };
+$("recRedo").onclick = function(){ recBlob = null; showRec(); startRec(); };
+$("recDrop").onclick = function(){ recBlob = null; showRec(); };
+function blobB64(blob){
+  return new Promise(function(res, rej){
+    var fr = new FileReader();
+    fr.onload = function(){ res(String(fr.result).replace(/^data:[^,]*,/, "")); };
+    fr.onerror = rej; fr.readAsDataURL(blob);
+  });
+}
 
 /* ---------- 新しいメモ ---------- */
 function resetForm(){
@@ -486,16 +536,21 @@ function resetForm(){
 function keepDraft(){ LS.set("im_draft", {text: $("fText").value, comment: $("fComment").value}); }
 $("fText").oninput = keepDraft; $("fComment").oninput = keepDraft;
 $("save").onclick = function(){
-  stopRec();
+  if (recOn){ toast("録音を止めてから保存してください"); return; }
   var text = $("fText").value.trim();
-  if (!text){ toast("メモが空です"); return; }
+  if (!text && !recBlob){ toast("録音かメモのどちらかを入れてください"); return; }
   var d = new Date();
   var id = d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + "_" + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds());
   var m = {id: id, date: $("fDate").value, time: $("fTime").value, text: text, comment: $("fComment").value.trim(),
            status: "active", more: 0, createdAt: d.toISOString()};
-  resetForm();
-  saveMemo(m).then(function(){ toast(outbox[id] ? "この端末に保存しました（つながったら送ります）" : "保存しました"); });
-  showTab("list");
+  var blob = recBlob, sec = recSec;
+  recBlob = null; showRec(); resetForm(); showTab("list");
+  var ready = Promise.resolve();
+  if (blob){
+    m.audio = "audio/" + id + (/mp4/.test(blob.type) ? ".m4a" : ".webm"); m.audioSec = sec;
+    ready = blobB64(blob).then(function(b64){ audioMem[id] = b64; try{ localStorage.setItem("im_au_" + id, JSON.stringify(b64)); }catch(e){} });
+  }
+  ready.then(function(){ return saveMemo(m); }).then(function(){ toast(outbox[id] ? "この端末に保存しました（つながったら送ります）" : "保存しました"); });
 };
 
 /* ---------- 設定 ---------- */
@@ -582,6 +637,7 @@ render();
 if (!cfg.token) showTab("set");
 sync();
 setInterval(function(){ if (!document.hidden && !recOn) sync(true); }, 60000);
+showRec();
 document.addEventListener("visibilitychange", function(){ if (!document.hidden) sync(true); });
 window.addEventListener("online", function(){ sync(true); });
 })();
